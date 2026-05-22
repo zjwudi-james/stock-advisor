@@ -130,10 +130,16 @@ code, name = selected
 # 自动获取市场概况（如未缓存）
 if st.session_state.market_cache is None:
     with st.spinner("获取市场概况..."):
-        st.session_state.market_cache = get_market_overview()
+        try:
+            st.session_state.market_cache = get_market_overview()
+        except Exception:
+            st.session_state.market_cache = None
 if st.session_state.index_cache is None:
-    with st.spinner("获取指数数据..."):
-        st.session_state.index_cache = get_index_data()
+    with st.spinner("获取指数数据（约20秒）..."):
+        try:
+            st.session_state.index_cache = get_index_data()
+        except Exception:
+            st.session_state.index_cache = None
 
 # ============ 数据获取 ============
 with st.spinner(f"正在获取 {name}({code}) 的实时数据..."):
@@ -150,12 +156,20 @@ with st.spinner("正在获取财务数据..."):
     financials = get_financials(code)
 
 with st.spinner("正在获取指数和板块数据..."):
-    index_data = st.session_state.index_cache or get_index_data()
-    if index_data and not st.session_state.index_cache:
-        st.session_state.index_cache = index_data
-    sector_list = get_sector_strength()
-    stock_sector = get_stock_sector(code)
-    sector_info = get_sector_rank(stock_sector, sector_list) if stock_sector and sector_list else None
+    try:
+        index_data = st.session_state.index_cache or get_index_data()
+        if index_data and not st.session_state.index_cache:
+            st.session_state.index_cache = index_data
+    except Exception:
+        index_data = st.session_state.index_cache
+    try:
+        sector_list = get_sector_strength()
+        stock_sector = get_stock_sector(code)
+        sector_info = get_sector_rank(stock_sector, sector_list) if stock_sector and sector_list else None
+    except Exception:
+        sector_list = None
+        stock_sector = None
+        sector_info = None
 
 # ============ 分析 ============
 result = st.session_state.analyzer.analyze(
