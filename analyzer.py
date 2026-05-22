@@ -6,13 +6,21 @@ from typing import Optional
 
 
 class StockAnalyzer:
-    """A 股多因子评分器。每个维度 0-100 分，等权汇总。"""
+    """A 股多因子评分器。每个维度 0-100 分，根据市场环境动态调整权重。"""
 
-    DIMENSION_WEIGHTS = {
+    # 默认权重（中性市场）
+    BASE_WEIGHTS = {
         "technical": 0.25,
         "fund_flow": 0.25,
         "sentiment": 0.25,
         "fundamental": 0.25,
+    }
+
+    # 不同市场环境的权重调整
+    REGIME_WEIGHTS = {
+        "bull": {"technical": 0.25, "fund_flow": 0.20, "sentiment": 0.20, "fundamental": 0.35},
+        "bear": {"technical": 0.25, "fund_flow": 0.15, "sentiment": 0.15, "fundamental": 0.45},
+        "range": {"technical": 0.35, "fund_flow": 0.30, "sentiment": 0.15, "fundamental": 0.20},
     }
 
     # ---- 主入口 ----
@@ -26,6 +34,8 @@ class StockAnalyzer:
         flow: Optional[pd.DataFrame],
         financials: Optional[dict],
         market: Optional[dict],
+        index_data: Optional[dict] = None,
+        sector_info: Optional[dict] = None,
     ) -> dict:
         dims = {}
         if hist is not None and not hist.empty:
@@ -33,12 +43,19 @@ class StockAnalyzer:
         if flow is not None and not flow.empty:
             dims["fund_flow"] = self.score_fund_flow(flow)
         if market is not None:
-            dims["sentiment"] = self.score_sentiment(realtime, hist, market)
+            dims["sentiment"] = self.score_sentiment(realtime, hist, market, index_data)
         if financials is not None or (realtime and realtime.get("pe_dynamic")):
             dims["fundamental"] = self.score_fundamental(financials, realtime)
 
-        total, recommendation, weight_info = self._aggregate(dims)
+        # 市场环境评估 + 动态权重
+        env = self._assess_market_environment(index_data, market)
+        DIMENSION_WEIGHTS = self.REGIME_WEIGHTS.get(env["regime"], self.BASE_WEIGHTS)
+
+        total, recommendation, weight_info = self._aggregate(dims, DIMENSION_WEIGHTS)
         data_quality = self._data_quality_note(dims)
+
+        # 风控：止损位、目标位、仓位建议
+        risk = self._calculate_risk_params(realtime, hist, total, env["regime"])
 
         return {
             "code": code,
@@ -48,20 +65,24 @@ class StockAnalyzer:
             "dimensions": dims,
             "weight_info": weight_info,
             "data_quality_note": data_quality,
+            "market_env": env,
+            "risk": risk,
+            "dynamic_weights": DIMENSION_WEIGHTS,
+            "sector_info": sector_info,
         }
 
     # ---- 聚合与建议 ----
 
-    def _aggregate(self, dims: dict) -> tuple:
+    def _aggregate(self, dims: dict, weights: dict) -> tuple:
         active = {k: v for k, v in dims.items() if v.get("score") is not None}
         if not active:
             return 50, "数据不足", "全部数据获取失败，默认中性50分"
 
-        total_weight = sum(self.DIMENSION_WEIGHTS[k] for k in active)
+        total_weight = sum(weights.get(k, 0) for k in active)
         scale = 1.0 / total_weight if total_weight > 0 else 1.0
         total = 0.0
         for k, v in active.items():
-            total += v["score"] * self.DIMENSION_WEIGHTS[k] * scale
+            total += v["score"] * weights.get(k, 0) * scale
 
         total = round(total)
 
@@ -76,7 +97,7 @@ class StockAnalyzer:
         else:
             rec = "卖出"
 
-        missing = [k for k in self.DIMENSION_WEIGHTS if k not in dims]
+        missing = [k for k in weights if k not in dims]
         weight_info = ""
         if missing:
             names = {"technical": "技术面", "fund_flow": "资金面",
@@ -106,7 +127,7 @@ class StockAnalyzer:
 
         trend = self._score_trend(closes)
         momentum = self._score_momentum(closes, highs, lows)
-        volatility = self._score_volatility(closes, highs, lows)
+        volatility = self._score_volatility(closes, highs, lows, hist)
 
         score = trend["score"] * 0.40 + momentum["score"] * 0.30 + volatility["score"] * 0.30
         all_signals = trend["signals"] + momentum["signals"] + volatility["signals"]
@@ -236,12 +257,12 @@ class StockAnalyzer:
 
         return {"score": max(0, min(100, score)), "signals": sigs}
 
-    def _score_volatility(self, closes, highs, lows) -> dict:
+    def _score_volatility(self, closes, highs, lows, hist: pd.DataFrame = None) -> dict:
         score = 50.0
         sigs = []
         last = len(closes) - 1
 
-        # BOLL
+        # ---- BOLL ----
         ma20 = pd.Series(closes).rolling(20).mean().values
         std20 = pd.Series(closes).rolling(20).std().values
         upper = ma20 + 2 * std20
@@ -251,13 +272,13 @@ class StockAnalyzer:
             width = (upper[last] - lower[last]) / ma20[last]
             pos = (closes[last] - lower[last]) / (upper[last] - lower[last] + 1e-10)
 
-            if pos > 0.95:
+            if pos > 0.90:
                 score += 8
                 sigs.append("触及BOLL上轨（强势）")
-            elif pos < 0.05:
+            elif pos < 0.12:
                 score += 15
                 sigs.append("触及BOLL下轨（超跌反弹预期）")
-            elif 0.4 < pos < 0.6:
+            elif 0.35 < pos < 0.65:
                 score += 5
                 sigs.append("BOLL中轨附近（稳健）")
 
@@ -265,7 +286,7 @@ class StockAnalyzer:
                 score += 5
                 sigs.append("BOLL收窄（变盘信号）")
 
-        # ATR 波动率
+        # ---- ATR 波动率 ----
         tr = np.maximum(
             highs[1:] - lows[1:],
             np.maximum(
@@ -280,7 +301,109 @@ class StockAnalyzer:
                 score -= 5
                 sigs.append(f"高波动 ATR%={atr_pct:.1f}%")
 
+        # ---- 量价分析 ----
+        if hist is not None and "volume" in hist.columns:
+            volumes = hist["volume"].values
+            score += self._score_volume_price(closes, volumes, sigs, last)
+
         return {"score": max(0, min(100, score)), "signals": sigs}
+
+    def _score_volume_price(self, closes: np.ndarray, volumes: np.ndarray, sigs: list, last: int) -> float:
+        """量价关系评分，返回加分增量。"""
+        delta = 0.0
+        if last < 25:
+            return delta
+
+        # 近5日 vs 前15日均量
+        vol_recent = np.mean(volumes[-5:])
+        vol_base = np.mean(volumes[-20:-5]) if len(volumes) >= 20 else np.mean(volumes[:-5])
+        vol_ratio = vol_recent / (vol_base + 1)
+
+        # 近5日和近20日价格变化
+        price_5d = (closes[last] - closes[last - 5]) / (closes[last - 5] + 1e-10)
+        price_20d = (closes[last] - closes[max(0, last - 20)]) / (closes[max(0, last - 20)] + 1e-10)
+
+        # --- 量价方向组合 ---
+        if price_5d > 0.02 and vol_ratio > 1.2:
+            delta += 10
+            sigs.append("价涨量增（健康上涨）")
+        elif price_5d > 0.02 and vol_ratio < 0.7:
+            delta -= 10
+            sigs.append("价涨量缩（上涨乏力）")
+        elif price_5d < -0.02 and vol_ratio > 1.5:
+            if price_20d < -0.15:
+                delta += 8
+                sigs.append("低位放量下跌（疑似主力吸筹）")
+            else:
+                delta -= 8
+                sigs.append("放量下跌（抛压较重）")
+        elif price_5d < -0.02 and vol_ratio < 0.7:
+            delta += 12
+            sigs.append("价跌量缩（抛压减轻，可能见底）")
+        elif price_5d < -0.02 and vol_ratio < 1.05:
+            # 阴跌但不放量 → 非恐慌性下跌
+            delta += 6
+            sigs.append("缩量阴跌（非恐慌抛售，关注企稳）")
+
+        # --- 放量突破 ---
+        if last >= 20:
+            vol_today = volumes[last]
+            ma20_vol = np.mean(volumes[-21:-1]) if len(volumes) >= 21 else np.mean(volumes[:-1])
+            price_change_today = (closes[last] - closes[last - 1]) / (closes[last - 1] + 1e-10)
+            if vol_today > ma20_vol * 1.5 and price_change_today > 0.015:
+                delta += 12
+                sigs.append("放量突破（量价齐升）")
+            elif vol_today > ma20_vol * 1.5 and price_change_today < -0.015:
+                delta -= 8
+                sigs.append("放量下挫（主力出货迹象）")
+
+        # --- 缩量回踩后企稳 ---
+        if last >= 5:
+            prev_3_vol = np.mean(volumes[-4:-1])
+            prev_10_vol = np.mean(volumes[-11:-1]) if len(volumes) >= 11 else prev_3_vol
+            prev_3_ret = (closes[last - 1] - closes[last - 4]) / (closes[last - 4] + 1e-10)
+            if prev_3_ret < -0.01 and prev_3_vol < prev_10_vol * 0.85 and volumes[last] > prev_3_vol * 1.2:
+                delta += 8
+                sigs.append("缩量回踩后放量企稳")
+
+        # --- 量价背离 ---
+        if last >= 60:
+            # 顶背离：价格新高，量能递减
+            recent_peak = np.max(closes[-15:])
+            prev_peak = np.max(closes[-45:-15])
+            if prev_peak > 0 and recent_peak > prev_peak:
+                recent_peak_idx = last - 15 + np.argmax(closes[-15:])
+                prev_peak_idx = last - 45 + np.argmax(closes[-45:-15])
+                vol_at_recent = np.mean(volumes[max(0, recent_peak_idx - 2):min(len(volumes), recent_peak_idx + 3)])
+                vol_at_prev = np.mean(volumes[max(0, prev_peak_idx - 2):min(len(volumes), prev_peak_idx + 3)])
+                if vol_at_recent < vol_at_prev * 0.7:
+                    delta -= 10
+                    sigs.append("量价顶背离（新高无量）")
+
+            # 底背离：价格新低，量能萎缩
+            recent_trough = np.min(closes[-15:])
+            prev_trough = np.min(closes[-45:-15])
+            if prev_trough > 0 and recent_trough < prev_trough:
+                recent_tr_idx = last - 15 + np.argmin(closes[-15:])
+                prev_tr_idx = last - 45 + np.argmin(closes[-45:-15])
+                vol_at_recent = np.mean(volumes[max(0, recent_tr_idx - 2):min(len(volumes), recent_tr_idx + 3)])
+                vol_at_prev = np.mean(volumes[max(0, prev_tr_idx - 2):min(len(volumes), prev_tr_idx + 3)])
+                if vol_at_recent < vol_at_prev * 0.8:
+                    delta += 10
+                    sigs.append("量价底背离（新低缩量）")
+
+        # --- 均量线趋势 ---
+        if len(volumes) >= 20:
+            vol_ma5 = pd.Series(volumes).rolling(5).mean().values
+            vol_ma20_arr = pd.Series(volumes).rolling(20).mean().values
+            if vol_ma5[last] > vol_ma20_arr[last] * 1.3:
+                delta += 5
+                sigs.append("成交量放大（市场关注度提升）")
+            elif vol_ma5[last] < vol_ma20_arr[last] * 0.5:
+                delta -= 3
+                sigs.append("成交量萎缩（交投清淡）")
+
+        return delta
 
     # ============ 资金面（25%） ============
 
@@ -359,6 +482,7 @@ class StockAnalyzer:
         realtime: Optional[dict],
         hist: Optional[pd.DataFrame],
         market: dict,
+        index_data: Optional[dict] = None,
     ) -> dict:
         score = 50.0
         sigs = []
@@ -407,6 +531,21 @@ class StockAnalyzer:
                 score -= 5
                 sigs.append(f"量比 {vol_ratio:.1f}（缩量）")
 
+        # 指数趋势影响
+        if index_data:
+            up_count = 0
+            for code, info in index_data.items():
+                if info.get("trend") == "上涨":
+                    up_count += 1
+                elif info.get("trend") == "下跌":
+                    up_count -= 1
+            if up_count >= 2:
+                score += 8
+                sigs.append("三大指数偏强")
+            elif up_count <= -2:
+                score -= 10
+                sigs.append("三大指数偏弱")
+
         # 换手率
         if realtime:
             turnover = realtime.get("turnover_rate", 0)
@@ -421,6 +560,243 @@ class StockAnalyzer:
                 sigs.append(f"换手率 {turnover:.1f}%（冷清）")
 
         return {"score": max(0, min(100, score)), "signals": sigs}
+
+    # ============ 基本面（25%） ============
+
+    # ============ 市场环境评估 ============
+
+    def _assess_market_environment(self, index_data: Optional[dict], market: Optional[dict]) -> dict:
+        """评估当前市场环境：牛市/熊市/震荡。"""
+        if index_data is None:
+            return {
+                "regime": "range",
+                "confidence": 0.0,
+                "signal": "无指数数据，默认震荡市",
+            }
+        trends = []
+        total_change = 0.0
+        count = 0
+        details = {}
+        for code, info in index_data.items():
+            trend = info.get("trend", "震荡")
+            details[info.get("name", code)] = {
+                "price": info["price"],
+                "change_pct": info["change_pct"],
+                "trend": trend,
+            }
+            if trend == "上涨":
+                trends.append(1)
+            elif trend == "下跌":
+                trends.append(-1)
+            else:
+                trends.append(0)
+            total_change += info.get("change_pct", 0)
+            count += 1
+        if count == 0:
+            return {"regime": "range", "confidence": 0.0, "signal": "指数数据异常"}
+
+        avg_trend = sum(trends) / len(trends)
+        avg_change = total_change / count
+
+        # 综合判定
+        if avg_trend >= 0.6 and avg_change > 0:
+            regime = "bull"
+            signal = "三大指数多头排列，市场处于上升趋势，可积极操作"
+            confidence = min(0.9, 0.5 + avg_trend * 0.3 + abs(avg_change) * 0.02)
+        elif avg_trend <= -0.6 and avg_change < 0:
+            regime = "bear"
+            signal = "三大指数空头排列，市场处于下降趋势，建议减仓或空仓观望"
+            confidence = min(0.9, 0.5 + abs(avg_trend) * 0.3 + abs(avg_change) * 0.02)
+        else:
+            regime = "range"
+            signal = "指数走势分化或震荡，市场方向不明，可高抛低吸但控制仓位"
+            confidence = 0.4 + abs(avg_trend) * 0.2
+
+        return {
+            "regime": regime,
+            "confidence": round(confidence, 2),
+            "signal": signal,
+            "indices": details,
+        }
+
+    # ============ 风控参数计算 ============
+
+    def _calculate_risk_params(
+        self,
+        realtime: Optional[dict],
+        hist: Optional[pd.DataFrame],
+        score: int,
+        regime: str,
+    ) -> dict:
+        """综合计算止损、止盈、仓位建议。"""
+        cur_price = realtime["price"] if realtime else 0
+        if hist is None or hist.empty or cur_price <= 0:
+            return {
+                "stop_loss": None,
+                "take_profit_1": None,
+                "take_profit_2": None,
+                "risk_reward": None,
+                "position_pct": None,
+                "position_note": "数据不足，无法计算风控参数",
+            }
+        closes = hist["close"].values
+        highs = hist["high"].values
+        lows = hist["low"].values
+        atr = self._calc_atr(closes, highs, lows)
+        atr_pct = atr / cur_price
+
+        # 止损位（基于 ATR + 关键支撑）
+        support = self._find_nearest_support(closes, lows, cur_price)
+        atr_stop = cur_price - 2.5 * atr
+        stop_loss = max(support, atr_stop) if support > 0 else atr_stop
+        stop_loss_pct = (cur_price - stop_loss) / cur_price * 100
+
+        # 止盈目标
+        resistance = self._find_nearest_resistance(closes, highs, cur_price)
+        tp1 = cur_price + (cur_price - stop_loss) * 2.0
+        tp2 = cur_price + (cur_price - stop_loss) * 3.5
+        if resistance > 0 and resistance < tp1:
+            tp1 = resistance
+            tp2 = resistance * 1.05
+        tp1_pct = (tp1 - cur_price) / cur_price * 100
+        tp2_pct = (tp2 - cur_price) / cur_price * 100
+
+        # 盈亏比
+        risk = cur_price - stop_loss
+        reward = tp1 - cur_price
+        rr = reward / risk if risk > 0 else 0
+
+        # 仓位建议
+        position = self._position_advice(score, regime, atr_pct, rr)
+        return {
+            "stop_loss": round(stop_loss, 2),
+            "stop_loss_pct": round(stop_loss_pct, 1),
+            "take_profit_1": round(tp1, 2),
+            "take_profit_1_pct": round(tp1_pct, 1),
+            "take_profit_2": round(tp2, 2),
+            "take_profit_2_pct": round(tp2_pct, 1),
+            "risk_reward": round(rr, 1),
+            "atr": round(atr, 2),
+            "atr_pct": round(atr_pct * 100, 2),
+            "key_support": round(support, 2) if support > 0 else None,
+            "key_resistance": round(resistance, 2) if resistance > 0 else None,
+            "position_pct": position["pct"],
+            "position_level": position["level"],
+            "position_note": position["note"],
+        }
+
+    def _calc_atr(self, closes: np.ndarray, highs: np.ndarray, lows: np.ndarray, period: int = 14) -> float:
+        """计算 ATR。"""
+        if len(closes) < period + 1:
+            return float(np.std(closes[-min(20, len(closes)):]) * 0.5)
+        prev_close = closes[-period-1:-1]
+        tr = np.maximum(
+            highs[-period:] - lows[-period:],
+            np.maximum(
+                np.abs(highs[-period:] - prev_close),
+                np.abs(lows[-period:] - prev_close),
+            ),
+        )
+        return float(np.mean(tr))
+
+    def _find_nearest_support(self, closes: np.ndarray, lows: np.ndarray, cur: float) -> float:
+        """找最近的支撑位。"""
+        if len(lows) < 20:
+            return 0.0
+        recent_lows = lows[-60:] if len(lows) >= 60 else lows
+        min_val = np.min(recent_lows[recent_lows < cur * 0.98]) if np.any(recent_lows < cur * 0.98) else 0
+        if min_val <= 0:
+            ma20 = float(np.mean(closes[-20:]))
+            min_val = ma20 * 0.95 if ma20 < cur else cur * 0.92
+        # 聚类找局部低点
+        candidates = sorted(recent_lows[(recent_lows > cur * 0.75) & (recent_lows < cur * 0.98)], reverse=True)
+        if len(candidates) > 0:
+            clusters = []
+            cluster = [candidates[0]]
+            for c in candidates[1:]:
+                if abs(c - cluster[-1]) / cur < 0.02:
+                    cluster.append(c)
+                else:
+                    clusters.append(float(np.mean(cluster)))
+                    cluster = [c]
+            clusters.append(float(np.mean(cluster)))
+            return clusters[0] if clusters else float(min_val)
+        return float(min_val)
+
+    def _find_nearest_resistance(self, closes: np.ndarray, highs: np.ndarray, cur: float) -> float:
+        """找最近的压力位。"""
+        if len(highs) < 20:
+            return 0.0
+        recent_highs = highs[-60:] if len(highs) >= 60 else highs
+        candidates = sorted(recent_highs[(recent_highs > cur * 1.02) & (recent_highs < cur * 1.25)])
+        if len(candidates) > 0:
+            clusters = []
+            cluster = [candidates[0]]
+            for c in candidates[1:]:
+                if abs(c - cluster[-1]) / cur < 0.02:
+                    cluster.append(c)
+                else:
+                    clusters.append(float(np.mean(cluster)))
+                    cluster = [c]
+            clusters.append(float(np.mean(cluster)))
+            return clusters[0] if clusters else 0.0
+        return float(np.max(recent_highs)) * 0.95 if np.max(recent_highs) > cur * 1.05 else cur * 1.1
+
+    def _position_advice(self, score: int, regime: str, atr_pct: float, rr: float) -> dict:
+        """根据评分、市场环境、波动率、盈亏比给出仓位建议。"""
+        # 基础仓位由评分决定
+        if score >= 80:
+            base_pct = 25
+        elif score >= 70:
+            base_pct = 18
+        elif score >= 60:
+            base_pct = 12
+        elif score >= 50:
+            base_pct = 8
+        elif score >= 40:
+            base_pct = 5
+        else:
+            base_pct = 0
+
+        # 市场环境调整
+        regime_mult = {"bull": 1.2, "range": 0.85, "bear": 0.4}
+        base_pct *= regime_mult.get(regime, 0.85)
+
+        # 波动率惩罚（高波动降低仓位）
+        if atr_pct > 0.05:
+            base_pct *= 0.6
+        elif atr_pct > 0.035:
+            base_pct *= 0.8
+
+        # 盈亏比惩罚
+        if rr < 1.5:
+            base_pct *= 0.5
+        elif rr > 3.0:
+            base_pct *= 1.1
+
+        pct = max(0, min(30, round(base_pct)))
+
+        if pct >= 20:
+            level = "重仓"
+        elif pct >= 12:
+            level = "中等仓位"
+        elif pct >= 5:
+            level = "轻仓试探"
+        else:
+            level = "不建议参与"
+
+        notes = {
+            "bull": "牛市环境下可适当积极",
+            "bear": "熊市环境，严格控制仓位",
+            "range": "震荡市，灵活控制仓位",
+        }
+        note = notes.get(regime, "")
+        if atr_pct > 0.05:
+            note += "；高波动标的，注意控制风险"
+        if rr < 1.5:
+            note += "；盈亏比偏低"
+
+        return {"pct": pct, "level": level, "note": note}
 
     # ============ 基本面（25%） ============
 

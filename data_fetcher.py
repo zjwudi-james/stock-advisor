@@ -212,6 +212,123 @@ def get_financials(code: str) -> Optional[dict]:
         return None
 
 
+# ---- 指数行情 ----
+
+def get_index_data() -> Optional[dict]:
+    """获取三大指数实时行情和近期走势（新浪历史+雪球实时）。"""
+    indices = {
+        "sh000001": "上证指数",
+        "sz399001": "深证成指",
+        "sz399006": "创业板指",
+    }
+    # 雪球 symbol 映射
+    xq_map = {"sh000001": "SH000001", "sz399001": "SZ399001", "sz399006": "SZ399006"}
+    try:
+        result = {}
+        for code, name in indices.items():
+            try:
+                # 用雪球获取实时价和涨跌幅
+                spot_df = ak.stock_individual_spot_xq(symbol=xq_map[code])
+                spot = dict(zip(spot_df["item"].values, spot_df["value"].values))
+                cur_price = _safe_float(spot.get("现价"))
+                change_pct = _safe_float(spot.get("涨幅"))
+
+                # 用新浪获取历史日线做趋势判断
+                hist_df = ak.stock_zh_index_daily(symbol=code)
+                if hist_df.empty or len(hist_df) < 60:
+                    trend = "数据不足"
+                    ma20 = ma60 = None
+                    high_20 = low_20 = None
+                else:
+                    closes = hist_df["close"].values[-60:]
+                    ma20 = float(pd.Series(closes).rolling(20).mean().values[-1])
+                    ma60 = float(pd.Series(closes).rolling(60).mean().values[-1]) if len(closes) >= 60 else ma20
+                    if cur_price > ma20 > ma60:
+                        trend = "上涨"
+                    elif cur_price < ma20 < ma60:
+                        trend = "下跌"
+                    else:
+                        trend = "震荡"
+                    high_20 = round(float(closes[-20:].max()), 2) if len(closes) >= 20 else None
+                    low_20 = round(float(closes[-20:].min()), 2) if len(closes) >= 20 else None
+
+                result[code] = {
+                    "name": name,
+                    "price": cur_price,
+                    "change_pct": change_pct,
+                    "trend": trend,
+                    "ma20": round(ma20, 2) if ma20 else None,
+                    "ma60": round(ma60, 2) if ma60 else None,
+                    "high_20d": high_20,
+                    "low_20d": low_20,
+                }
+            except Exception:
+                continue
+        return result if result else None
+    except Exception:
+        return None
+
+
+def get_sector_strength() -> Optional[list]:
+    """获取行业板块涨跌幅排名（用同花顺行业列表，新浪板块行情）。"""
+    try:
+        # 尝试同花顺行业分类
+        industry_df = ak.stock_board_industry_name_ths()
+        if industry_df.empty:
+            return None
+        result = []
+        # 列名可能是乱码，用位置访问：第一列是 name, 第二列是 code
+        cols = industry_df.columns.tolist()
+        name_col = cols[0]
+        code_col = cols[1]
+        for _, row in industry_df.iterrows():
+            result.append({
+                "name": str(row[name_col]),
+                "code": str(row[code_col]),
+                "change_pct": 0.0,  # 同花顺行业列表无涨跌幅，后续用雪球补充
+            })
+        return result if result else None
+    except Exception:
+        return None
+
+
+def get_stock_sector(code: str) -> Optional[str]:
+    """获取个股所属行业板块（雪球）。"""
+    try:
+        df = ak.stock_individual_basic_info_xq(symbol=_to_xq_symbol(code))
+        if df.empty:
+            return None
+        industry_row = df[df["item"] == "affiliate_industry"]
+        if not industry_row.empty:
+            raw = str(industry_row.iloc[0]["value"])
+            # 解析 JSON 格式的行业信息 {'ind_code': 'BK0088', 'ind_name': '白酒'}
+            import json
+            try:
+                obj = json.loads(raw.replace("'", '"'))
+                return obj.get("ind_name", raw)
+            except (json.JSONDecodeError, ValueError):
+                return raw
+        return None
+    except Exception:
+        return None
+
+
+def get_sector_rank(sector_name: str, sector_list: list) -> Optional[dict]:
+    """在板块排名中查找指定板块的位置。"""
+    if not sector_name or not sector_list:
+        return None
+    for idx, s in enumerate(sector_list):
+        if sector_name in s["name"] or s["name"] in sector_name:
+            return {
+                "name": s["name"],
+                "change_pct": s.get("change_pct", 0),
+                "rank": idx + 1,
+                "total": len(sector_list),
+                "percentile": round((idx + 1) / len(sector_list) * 100, 1),
+            }
+    return None
+
+
 # ---- 市场概况 ----
 
 def get_market_overview() -> Optional[dict]:

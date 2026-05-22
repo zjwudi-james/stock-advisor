@@ -9,6 +9,7 @@ from plotly.subplots import make_subplots
 from data_fetcher import (
     get_stock_list, search_stock, get_realtime, get_history,
     get_fund_flow, get_financials, get_market_overview,
+    get_index_data, get_sector_strength, get_stock_sector, get_sector_rank,
 )
 from analyzer import StockAnalyzer
 
@@ -47,6 +48,8 @@ if "analyzer" not in st.session_state:
     st.session_state.analyzer = StockAnalyzer()
 if "market_cache" not in st.session_state:
     st.session_state.market_cache = None
+if "index_cache" not in st.session_state:
+    st.session_state.index_cache = None
 
 
 # ---- 侧边栏 ----
@@ -55,11 +58,11 @@ with st.sidebar:
     st.markdown("""
     **A 股股票分析顾问**
 
-    基于四个维度综合评分：
-    - **技术面** (25%) — MA/MACD/RSI/KDJ/BOLL
-    - **资金面** (25%) — 主力资金流向
-    - **情绪面** (25%) — 市场广度/量比/换手率
-    - **基本面** (25%) — PE/PB/ROE/增长
+    基于四个维度综合评分，根据大盘环境动态调权：
+    - **技术面** — MA/MACD/RSI/KDJ/BOLL
+    - **资金面** — 主力资金流向
+    - **情绪面** — 市场广度/量比/换手率/指数趋势
+    - **基本面** — PE/PB/ROE/增长
 
     数据来源：雪球 + 东方财富 + 新浪（akshare）
 
@@ -71,10 +74,16 @@ with st.sidebar:
     if st.button("刷新市场数据", use_container_width=True):
         with st.spinner("获取市场概况（约15秒）..."):
             st.session_state.market_cache = get_market_overview()
+            st.session_state.index_cache = get_index_data()
     if st.session_state.market_cache:
         m = st.session_state.market_cache
         st.caption(f"涨: {m['up_count']} | 跌: {m['down_count']}")
         st.caption(f"成交额: {m['total_amount']/1e8:.0f}亿")
+    if st.session_state.index_cache:
+        for code, info in st.session_state.index_cache.items():
+            chg = info.get("change_pct", 0)
+            trend_emoji = {"上涨": "🟢", "下跌": "🔴", "震荡": "🟡"}.get(info.get("trend", ""), "")
+            st.caption(f"{trend_emoji} {info.get('name', code)}: {info['price']:.0f} ({chg:+.2f}%)")
 
 
 # ---- 主界面 ----
@@ -118,6 +127,14 @@ if not selected:
 
 code, name = selected
 
+# 自动获取市场概况（如未缓存）
+if st.session_state.market_cache is None:
+    with st.spinner("获取市场概况..."):
+        st.session_state.market_cache = get_market_overview()
+if st.session_state.index_cache is None:
+    with st.spinner("获取指数数据..."):
+        st.session_state.index_cache = get_index_data()
+
 # ============ 数据获取 ============
 with st.spinner(f"正在获取 {name}({code}) 的实时数据..."):
     realtime = get_realtime(code)
@@ -132,10 +149,19 @@ with st.spinner("正在获取资金流向..."):
 with st.spinner("正在获取财务数据..."):
     financials = get_financials(code)
 
+with st.spinner("正在获取指数和板块数据..."):
+    index_data = st.session_state.index_cache or get_index_data()
+    if index_data and not st.session_state.index_cache:
+        st.session_state.index_cache = index_data
+    sector_list = get_sector_strength()
+    stock_sector = get_stock_sector(code)
+    sector_info = get_sector_rank(stock_sector, sector_list) if stock_sector and sector_list else None
+
 # ============ 分析 ============
 result = st.session_state.analyzer.analyze(
     code=code, name=name, realtime=realtime, hist=hist,
     flow=flow, financials=financials, market=market,
+    index_data=index_data, sector_info=sector_info,
 )
 
 # ============ 顶部横幅：实时价格 + 建议 ============
@@ -227,6 +253,149 @@ for i, dk in enumerate(dim_keys):
                 <div style="font-size:18px; color:#999; margin-top:8px;">无数据</div>
             </div>
             """, unsafe_allow_html=True)
+
+# ============ 市场环境 + 行业板块 ============
+st.markdown("---")
+env = result.get("market_env", {})
+risk = result.get("risk", {})
+sector = result.get("sector_info")
+dw = result.get("dynamic_weights", {})
+
+if env:
+    col_env, col_sector, col_weight = st.columns([2, 1, 1])
+    with col_env:
+        regime = env.get("regime", "range")
+        regime_labels = {"bull": ("牛市", "#dc3545"), "bear": ("熊市", "#198754"), "range": ("震荡市", "#fd7e14")}
+        rl = regime_labels.get(regime, ("震荡市", "#fd7e14"))
+        st.markdown(f"""
+        <div style="padding:12px; background:#f8f9fa; border-radius:8px; border-left:4px solid {rl[1]};">
+            <div style="font-size:12px; color:#6c757d;">大盘环境</div>
+            <div style="font-size:20px; font-weight:bold; color:{rl[1]};">{rl[0]} (置信度: {env.get('confidence', 0):.0%})</div>
+            <div style="font-size:12px; color:#6c757d; margin-top:4px;">{env.get('signal', '')}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        # 指数明细
+        indices = env.get("indices", {})
+        if indices:
+            idx_cols = st.columns(len(indices))
+            for i, (idx_name, idx_info) in enumerate(indices.items()):
+                chg = idx_info.get("change_pct", 0)
+                idx_cols[i].metric(
+                    idx_name,
+                    f"{idx_info['price']:.0f}",
+                    delta=f"{chg:+.2f}%",
+                )
+                idx_cols[i].caption(f"趋势: {idx_info.get('trend', 'N/A')}")
+
+    with col_sector:
+        if sector:
+            pct = sector.get("percentile", 50)
+            color = "#dc3545" if pct <= 30 else "#fd7e14" if pct <= 50 else "#6c757d"
+            st.markdown(f"""
+            <div style="padding:12px; background:#f8f9fa; border-radius:8px; border-left:4px solid {color};">
+                <div style="font-size:12px; color:#6c757d;">所属行业</div>
+                <div style="font-size:16px; font-weight:bold;">{sector.get('name', 'N/A')}</div>
+                <div style="font-size:13px; color:{'#dc3545' if sector.get('change_pct', 0) > 0 else '#198754'};">
+                    {sector.get('change_pct', 0):+.2f}%
+                </div>
+                <div style="font-size:11px; color:#6c757d;">排名 {sector.get('rank')}/{sector.get('total')} (前{pct}%)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style="padding:12px; background:#f8f9fa; border-radius:8px; border-left:4px solid #ccc;">
+                <div style="font-size:12px; color:#6c757d;">所属行业</div>
+                <div style="font-size:14px; color:#999;">获取失败</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_weight:
+        w_names = {"technical": "技术", "fund_flow": "资金", "sentiment": "情绪", "fundamental": "基本面"}
+        w_lines = ""
+        for k in ["technical", "fund_flow", "sentiment", "fundamental"]:
+            w = dw.get(k, 0)
+            w_lines += f"<div style='font-size:12px;'>{w_names.get(k, k)}: <b>{w:.0%}</b></div>"
+        st.markdown(f"""
+        <div style="padding:12px; background:#f8f9fa; border-radius:8px; border-left:4px solid #6c757d;">
+            <div style="font-size:12px; color:#6c757d;">当前权重分配</div>
+            {w_lines}
+        </div>
+        """, unsafe_allow_html=True)
+
+# ============ 风控建议 ============
+if risk and risk.get("stop_loss"):
+    st.markdown("---")
+    st.markdown("### 风控与操作建议")
+
+    col_risk1, col_risk2, col_risk3, col_risk4 = st.columns(4)
+
+    with col_risk1:
+        stop_loss = risk.get("stop_loss", 0)
+        stop_pct = risk.get("stop_loss_pct", 0)
+        cur_price = realtime["price"] if realtime else 0
+        st.markdown(f"""
+        <div style="padding:12px; background:#fff5f5; border-radius:8px; border:1px solid #ffc9c9; text-align:center;">
+            <div style="font-size:11px; color:#c92a2a;">止损位</div>
+            <div style="font-size:22px; font-weight:bold; color:#c92a2a;">{stop_loss:.2f}</div>
+            <div style="font-size:12px; color:#c92a2a;">-{stop_pct}%</div>
+            <div style="font-size:10px; color:#868e96; margin-top:4px;">跌破此价建议离场</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_risk2:
+        tp1 = risk.get("take_profit_1", 0)
+        tp1_pct = risk.get("take_profit_1_pct", 0)
+        st.markdown(f"""
+        <div style="padding:12px; background:#f0fff4; border-radius:8px; border:1px solid #b2f2bb; text-align:center;">
+            <div style="font-size:11px; color:#2b8a3e;">第一目标位</div>
+            <div style="font-size:22px; font-weight:bold; color:#2b8a3e;">{tp1:.2f}</div>
+            <div style="font-size:12px; color:#2b8a3e;">+{tp1_pct}%</div>
+            <div style="font-size:10px; color:#868e96; margin-top:4px;">建议减仓 1/2</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_risk3:
+        tp2 = risk.get("take_profit_2", 0)
+        tp2_pct = risk.get("take_profit_2_pct", 0)
+        st.markdown(f"""
+        <div style="padding:12px; background:#f0fff4; border-radius:8px; border:1px solid #b2f2bb; text-align:center;">
+            <div style="font-size:11px; color:#2b8a3e;">第二目标位</div>
+            <div style="font-size:22px; font-weight:bold; color:#2b8a3e;">{tp2:.2f}</div>
+            <div style="font-size:12px; color:#2b8a3e;">+{tp2_pct}%</div>
+            <div style="font-size:10px; color:#868e96; margin-top:4px;">建议全部止盈</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_risk4:
+        rr = risk.get("risk_reward", 0)
+        rr_color = "#2b8a3e" if rr >= 2.5 else "#fd7e14" if rr >= 1.5 else "#c92a2a"
+        rr_text = "优秀" if rr >= 2.5 else "合格" if rr >= 1.5 else "不佳"
+        position_pct = risk.get("position_pct", 0)
+        position_level = risk.get("position_level", "N/A")
+        pos_color = "#dc3545" if position_pct >= 20 else "#fd7e14" if position_pct >= 12 else "#6c757d" if position_pct >= 5 else "#999"
+        st.markdown(f"""
+        <div style="padding:12px; background:#f8f9fa; border-radius:8px; border:1px solid #dee2e6; text-align:center;">
+            <div style="font-size:11px; color:#6c757d;">综合风控评估</div>
+            <div style="font-size:14px; margin-top:4px;">盈亏比: <b style="color:{rr_color};">{rr:.1f}:1</b> ({rr_text})</div>
+            <div style="font-size:14px; margin-top:4px;">ATR: <b>{risk.get('atr', 0):.2f}</b> ({risk.get('atr_pct', 0)}%)</div>
+            <div style="font-size:18px; font-weight:bold; color:{pos_color}; margin-top:6px;">{position_level} ({position_pct}%)</div>
+            <div style="font-size:10px; color:#868e96; margin-top:4px;">{risk.get('position_note', '')}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 关键支撑/压力明细
+    col_sr1, col_sr2 = st.columns(2)
+    with col_sr1:
+        ks = risk.get("key_support")
+        if ks:
+            st.caption(f"关键支撑位: {ks:.2f} | 止损位: {stop_loss:.2f} (取 ATR 止损和支撑位的较高值)")
+        else:
+            st.caption(f"止损依据: 2.5×ATR = {risk.get('atr', 0) * 2.5:.2f}")
+    with col_sr2:
+        kr = risk.get("key_resistance")
+        if kr:
+            st.caption(f"关键压力位: {kr:.2f}")
+
 
 # ============ 技术面详细分析 ============
 st.markdown("---")
