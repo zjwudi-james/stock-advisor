@@ -215,57 +215,55 @@ def get_financials(code: str) -> Optional[dict]:
 # ---- 指数行情 ----
 
 def get_index_data() -> Optional[dict]:
-    """获取三大指数实时行情和近期走势（新浪历史+雪球实时）。
+    """获取三大指数实时行情和趋势判断（雪球实时数据，无需历史K线，速度较快）。
 
-    注：stock_zh_index_daily 会拉取全量历史数据，三个指数串行较慢（约15-30秒）。
-    如果单个指数超过30秒未返回则跳过。
+    趋势判断基于价格在52周范围内的位置：
+    - 价格处于52周高位（>70%分位）且今日上涨 → 上涨趋势
+    - 价格处于52周低位（<30%分位）且今日下跌 → 下跌趋势
+    - 其他 → 震荡
     """
-    import signal
     indices = {
-        "sh000001": "上证指数",
-        "sz399001": "深证成指",
-        "sz399006": "创业板指",
+        "SH000001": "上证指数",
+        "SZ399001": "深证成指",
+        "SZ399006": "创业板指",
     }
-    xq_map = {"sh000001": "SH000001", "sz399001": "SZ399001", "sz399006": "SZ399006"}
     result = {}
     for code, name in indices.items():
         try:
-            spot_df = ak.stock_individual_spot_xq(symbol=xq_map[code])
+            spot_df = ak.stock_individual_spot_xq(symbol=code)
             if spot_df.empty:
                 continue
             spot = dict(zip(spot_df["item"].values, spot_df["value"].values))
             cur_price = _safe_float(spot.get("现价"))
             change_pct = _safe_float(spot.get("涨幅"))
+            high_52w = _safe_float(spot.get("52周最高"))
+            low_52w = _safe_float(spot.get("52周最低"))
             if cur_price <= 0:
                 continue
 
-            hist_df = ak.stock_zh_index_daily(symbol=code)
-            if hist_df is None or hist_df.empty or len(hist_df) < 60:
-                # 历史数据不足时仅提供实时价
-                result[code] = {
-                    "name": name, "price": cur_price, "change_pct": change_pct,
-                    "trend": "数据不足", "ma20": None, "ma60": None,
-                    "high_20d": None, "low_20d": None,
-                }
-                continue
-
-            closes = hist_df["close"].values[-90:]
-            ma20 = float(pd.Series(closes).rolling(20).mean().values[-1])
-            ma60_arr = pd.Series(closes).rolling(60).mean().values
-            ma60 = float(ma60_arr[-1]) if len(closes) >= 60 and not pd.isna(ma60_arr[-1]) else ma20
-            if cur_price > ma20 > ma60:
-                trend = "上涨"
-            elif cur_price < ma20 < ma60:
-                trend = "下跌"
+            # 基于价格在52周范围的位置判断趋势
+            if high_52w > 0 and low_52w > 0 and high_52w > low_52w:
+                pos_52w = (cur_price - low_52w) / (high_52w - low_52w)
+                if pos_52w > 0.7 and change_pct > 0:
+                    trend = "上涨"
+                elif pos_52w < 0.3 and change_pct < 0:
+                    trend = "下跌"
+                elif pos_52w > 0.6:
+                    trend = "偏强震荡"
+                elif pos_52w < 0.4:
+                    trend = "偏弱震荡"
+                else:
+                    trend = "震荡"
             else:
-                trend = "震荡"
-            high_20 = round(float(closes[-20:].max()), 2)
-            low_20 = round(float(closes[-20:].min()), 2)
+                trend = "数据不足"
 
             result[code] = {
-                "name": name, "price": cur_price, "change_pct": change_pct,
-                "trend": trend, "ma20": round(ma20, 2), "ma60": round(ma60, 2),
-                "high_20d": high_20, "low_20d": low_20,
+                "name": name,
+                "price": cur_price,
+                "change_pct": change_pct,
+                "trend": trend,
+                "high_52w": round(high_52w, 2) if high_52w > 0 else None,
+                "low_52w": round(low_52w, 2) if low_52w > 0 else None,
             }
         except Exception:
             continue

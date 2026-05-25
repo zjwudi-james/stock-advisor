@@ -583,10 +583,12 @@ class StockAnalyzer:
                 "price": info["price"],
                 "change_pct": info["change_pct"],
                 "trend": trend,
+                "high_52w": info.get("high_52w"),
+                "low_52w": info.get("low_52w"),
             }
-            if trend == "上涨":
+            if "上涨" in trend:
                 trends.append(1)
-            elif trend == "下跌":
+            elif "下跌" in trend:
                 trends.append(-1)
             else:
                 trends.append(0)

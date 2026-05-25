@@ -54,23 +54,7 @@ if "index_cache" not in st.session_state:
 
 # ---- 侧边栏 ----
 with st.sidebar:
-    st.header("关于本工具")
-    st.markdown("""
-    **A 股股票分析顾问**
-
-    基于四个维度综合评分，根据大盘环境动态调权：
-    - **技术面** — MA/MACD/RSI/KDJ/BOLL
-    - **资金面** — 主力资金流向
-    - **情绪面** — 市场广度/量比/换手率/指数趋势
-    - **基本面** — PE/PB/ROE/增长
-
-    数据来源：雪球 + 东方财富 + 新浪（akshare）
-
-    ⚠️ 仅供参考，不构成投资建议
-    """)
     st.caption(f"已加载 {len(st.session_state.stock_list)} 只股票")
-
-    st.divider()
     if st.button("刷新市场数据", use_container_width=True):
         with st.spinner("获取市场概况（约15秒）..."):
             st.session_state.market_cache = get_market_overview()
@@ -82,8 +66,9 @@ with st.sidebar:
     if st.session_state.index_cache:
         for code, info in st.session_state.index_cache.items():
             chg = info.get("change_pct", 0)
-            trend_emoji = {"上涨": "🟢", "下跌": "🔴", "震荡": "🟡"}.get(info.get("trend", ""), "")
-            st.caption(f"{trend_emoji} {info.get('name', code)}: {info['price']:.0f} ({chg:+.2f}%)")
+            t = info.get("trend", "")
+            emoji = {"上涨": "🟢", "偏强震荡": "🟡", "震荡": "🟡", "偏弱震荡": "🟠", "下跌": "🔴"}.get(t, "⚪")
+            st.caption(f"{emoji} {info.get('name', code)}: {info['price']:.0f} ({chg:+.2f}%)")
 
 
 # ---- 主界面 ----
