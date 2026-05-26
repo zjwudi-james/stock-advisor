@@ -5,9 +5,10 @@
 功能：
   1. 加载 watchlist/YYYY-MM.json 中的 top 20
   2. 获取每只股票实时行情（~30s）
-  3. 检查预警：止损/止盈/异动
-  4. 保存当日快照 JSON
-  5. 更新累计跟踪 summary.md
+  3. 计算每日综合评分（基于实时数据 + 60日K线）
+  4. 检查预警：止损/止盈/异动/评分大幅变化
+  5. 保存当日快照 JSON
+  6. 更新累计跟踪 summary.md
 """
 
 import sys
@@ -18,9 +19,10 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
-from data_fetcher import get_realtime, get_index_data
+from data_fetcher import get_realtime, get_index_data, get_history
 
 BASE_DIR = Path(r"C:\Users\zhangjie\Claude\投资分析\实战演练")
 WATCHLIST_DIR = BASE_DIR / "watchlist"
@@ -96,6 +98,129 @@ def check_alerts(entry, realtime, risk):
     return alerts
 
 
+def daily_score(realtime, hist, baseline_score):
+    """计算每日综合评分（0-100）。
+
+    基于实时数据 + 60日K线快速计算，四个维度：
+    - 估值(25分): PE/PB
+    - 动量(25分): RSI/KDJ/价格位置
+    - 情绪(25分): 换手率/量比/涨跌幅
+    - 趋势(25分): MA排列/MACD
+    """
+    score = 50.0
+    signals = []
+
+    # ---- 估值（25分） ----
+    pe = realtime.get("pe_dynamic", 0)
+    pb = realtime.get("pb", 0)
+    if 0 < pe < 15:
+        score += 15
+        signals.append(f"PE={pe:.1f}(低估)")
+    elif 15 <= pe < 30:
+        score += 8
+        signals.append(f"PE={pe:.1f}(合理)")
+    elif 60 <= pe < 200:
+        score -= 8
+        signals.append(f"PE={pe:.1f}(偏高)")
+    elif pe >= 200 or pe <= 0:
+        score -= 12
+        signals.append(f"PE={pe:.1f}(异常)")
+    if 0 < pb < 1.5:
+        score += 10
+        signals.append(f"PB={pb:.2f}(低)")
+    elif pb > 10:
+        score -= 5
+        signals.append(f"PB={pb:.2f}(高)")
+
+    # ---- 情绪（25分） ----
+    chg = realtime.get("change_pct", 0)
+    turnover = realtime.get("turnover_rate", 0)
+    vr = realtime.get("volume_ratio", 1.0)
+
+    if -2 < chg < 0:
+        score += 5
+        signals.append("微跌回调")
+    elif 0 <= chg < 2:
+        score += 3
+    elif chg > 4:
+        score -= 3
+        signals.append(f"急涨{chg:+.1f}%")
+    elif chg < -4:
+        score += 3
+        signals.append(f"急跌{chg:+.1f}%")
+
+    if 2 < turnover < 8:
+        score += 10
+        signals.append(f"换手{turnover:.1f}%(活跃)")
+    elif turnover >= 10:
+        score -= 3
+        signals.append(f"换手{turnover:.1f}%(过热)")
+    elif turnover < 0.5:
+        score -= 5
+        signals.append("换手极低(冷清)")
+
+    if vr > 1.5:
+        score += 5
+        signals.append("放量")
+    elif vr < 0.5:
+        score -= 3
+        signals.append("缩量")
+
+    # ---- 趋势 + 动量（25分，来自60日K线） ----
+    if hist is not None and not hist.empty and len(hist) >= 30:
+        closes = hist["close"].values
+        last = len(closes) - 1
+
+        # MA 排列
+        ma5 = pd.Series(closes).rolling(5).mean().values
+        ma10 = pd.Series(closes).rolling(10).mean().values
+        ma20 = pd.Series(closes).rolling(20).mean().values
+        if ma5[last] > ma10[last] > ma20[last]:
+            score += 12
+            signals.append("短均多头")
+        elif ma5[last] < ma10[last] < ma20[last]:
+            score -= 8
+            signals.append("短均空头")
+        elif ma5[last] > ma10[last]:
+            score += 5
+
+        # MACD
+        ema12 = pd.Series(closes).ewm(span=12).mean().values
+        ema26 = pd.Series(closes).ewm(span=26).mean().values
+        dif = ema12 - ema26
+        dea = pd.Series(dif).ewm(span=9).mean().values
+        if dif[last] > dea[last] and dif[last] > 0:
+            score += 8
+            signals.append("MACD多头")
+        elif dif[last] < dea[last] and dif[last] < 0:
+            score -= 6
+            signals.append("MACD空头")
+
+        # RSI
+        delta = np.diff(closes)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = pd.Series(gain).ewm(alpha=1/14).mean().values
+        avg_loss = pd.Series(loss).ewm(alpha=1/14).mean().values
+        rs = avg_gain / (avg_loss + 1e-10)
+        rsi = 100 - 100 / (1 + rs)
+        rsi_val = rsi[-1]
+        if rsi_val > 75:
+            score -= 5
+            signals.append(f"RSI={rsi_val:.0f}(超买)")
+        elif rsi_val < 25:
+            score += 5
+            signals.append(f"RSI={rsi_val:.0f}(超卖)")
+        elif 40 < rsi_val < 60:
+            score += 3
+    else:
+        # 无历史数据，基于价格变化估计
+        signals.append("无K线数据")
+
+    final_score = max(0, min(100, round(score)))
+    return {"score": final_score, "signals": signals[:6]}
+
+
 def run_track(ym_str):
     """执行日跟踪。"""
     today = datetime.now().strftime("%Y-%m-%d")
@@ -123,6 +248,7 @@ def run_track(ym_str):
     for item in top20:
         code = item["code"]
         name = item["name"]
+        baseline_score = item.get("total_score", 0)
         try:
             rt = get_realtime(code)
             if rt is None or rt["price"] <= 0:
@@ -133,12 +259,31 @@ def run_track(ym_str):
                     "current_price": None,
                     "change_from_entry_pct": None,
                     "today_change_pct": None,
+                    "baseline_score": baseline_score,
+                    "daily_score": None,
+                    "score_change": None,
                     "alerts": ["⚠️ 数据获取失败"],
                 })
                 continue
 
+            # 每日评分：获取60日K线做技术和趋势判断
+            hist = None
+            try:
+                hist = get_history(code, days=60)
+            except Exception:
+                pass
+            ds = daily_score(rt, hist, baseline_score)
+            score_change = ds["score"] - baseline_score
+
             risk = item.get("risk", {})
             alerts = check_alerts(item, rt, risk)
+
+            # 评分大幅变化预警
+            if score_change <= -15:
+                alerts.append(f"📉 评分大幅下降 {score_change:+d}（{baseline_score}→{ds['score']}）")
+            elif score_change >= 10:
+                alerts.append(f"📈 评分显著上升 {score_change:+d}（{baseline_score}→{ds['score']}）")
+
             entry_price = risk.get("entry_price", rt["price"])
             total_chg = (rt["price"] - entry_price) / entry_price * 100 if entry_price > 0 else 0
 
@@ -151,14 +296,20 @@ def run_track(ym_str):
                 "today_change_pct": round(rt.get("change_pct", 0), 1),
                 "turnover_rate": round(rt.get("turnover_rate", 0), 2),
                 "volume_ratio": round(rt.get("volume_ratio", 1.0), 2),
+                "baseline_score": baseline_score,
+                "daily_score": ds["score"],
+                "score_change": score_change,
+                "daily_signals": ds["signals"],
                 "alerts": alerts,
             }
             entries.append(entry_data)
+
+            score_str = f"评分 {ds['score']}({score_change:+d})"
             if alerts:
                 alert_summary.extend(alerts)
-                log(f"  {code} {name}: 价格 {rt['price']:.2f} ({total_chg:+.1f}%) | 预警: {', '.join(alerts)}")
+                log(f"  {code} {name}: {rt['price']:.2f} | {score_str} | 预警: {', '.join(alerts)}")
             else:
-                log(f"  {code} {name}: 价格 {rt['price']:.2f} ({total_chg:+.1f}%)")
+                log(f"  {code} {name}: {rt['price']:.2f} | {score_str}")
         except Exception as e:
             log(f"  {code} {name}: ERROR: {e}")
 
@@ -202,8 +353,10 @@ def run_track(ym_str):
     down_count = sum(1 for e in entries if e.get("change_from_entry_pct", 0) and e["change_from_entry_pct"] < 0)
     valid_entries = [e for e in entries if e["current_price"] is not None]
     avg_chg = sum(e.get("change_from_entry_pct", 0) for e in valid_entries) / len(valid_entries) if valid_entries else 0
+    avg_daily_score = sum(e.get("daily_score", 0) or 0 for e in entries) / len(entries) if entries else 0
+    avg_baseline = sum(e.get("baseline_score", 0) or 0 for e in entries) / len(entries) if entries else 0
     print(f"跟踪: {len(valid_entries)}/{len(entries)} 有效 | 上涨: {up_count} | 下跌: {down_count} | 预警: {alert_count}")
-    print(f"平均累计涨跌: {avg_chg:+.1f}%")
+    print(f"平均累计涨跌: {avg_chg:+.1f}% | 平均日评: {avg_daily_score:.0f}分（月评: {avg_baseline:.0f}分）")
     if alert_summary:
         print(f"\n预警详情:")
         for a in alert_summary:
@@ -226,17 +379,22 @@ def update_summary(ym_str, today, entries, alert_summary, index_data):
             f.write(f"扫描日期: {today}\n\n---\n\n")
 
         f.write(f"## {today}\n\n")
-        f.write("| # | 代码 | 名称 | 入场价 | 现价 | 累计涨跌 | 今日涨跌 | 预警 |\n")
-        f.write("|---|------|------|--------|------|----------|----------|------|\n")
+        f.write("| # | 代码 | 名称 | 入场价 | 现价 | 累计涨跌 | 今日涨跌 | 月评→日评 | 预警 |\n")
+        f.write("|---|------|------|--------|------|----------|----------|-----------|------|\n")
         for e in entries:
             ep = e.get("entry_price", 0)
             cp = e.get("current_price") or 0
             total = e.get("change_from_entry_pct") or 0
             today_chg = e.get("today_change_pct") or 0
+            bs = e.get("baseline_score") or 0
+            ds = e.get("daily_score")
+            ds_str = f"{ds}({e.get('score_change', 0):+d})" if ds is not None else "-"
             alert_str = " ".join(e.get("alerts", [])) if e.get("alerts") else "-"
-            f.write(f"| {e['code']} | {e['name']} | {ep:.2f} | {cp:.2f} | {total:+.1f}% | {today_chg:+.1f}% | {alert_str} |\n")
+            f.write(f"| {e['code']} | {e['name']} | {ep:.2f} | {cp:.2f} | {total:+.1f}% | {today_chg:+.1f}% | {bs}→{ds_str} | {alert_str} |\n")
 
-        f.write(f"\n**今日统计**: 上涨 {up_count} / 下跌 {down_count} / 预警 {len(alert_summary)} / 平均累计涨跌 {avg_chg:+.1f}%\n")
+        avg_daily = sum(e.get("daily_score", 0) or 0 for e in entries) / len(entries) if entries else 0
+        avg_baseline = sum(e.get("baseline_score", 0) or 0 for e in entries) / len(entries) if entries else 0
+        f.write(f"\n**今日统计**: 上涨 {up_count} / 下跌 {down_count} / 预警 {len(alert_summary)} / 平均累计涨跌 {avg_chg:+.1f}% / 平均日评 {avg_daily:.0f}分（月评 {avg_baseline:.0f}分）\n")
         if alert_summary:
             for a in alert_summary:
                 f.write(f"- {a}\n")
