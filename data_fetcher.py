@@ -83,26 +83,28 @@ def search_stock(keyword: str, stock_list: list) -> list[tuple[str, str]]:
 # ---- 实时行情（雪球） ----
 
 def _load_xq_token() -> Optional[str]:
-    """加载雪球 token。优先级：环境变量 > .xqtoken 文件 > Streamlit secrets。"""
-    # 1. 环境变量
+    """加载雪球 token。优先级：环境变量 > Streamlit secrets > 本地文件。"""
     import os
-    token = os.environ.get("XQ_TOKEN")
+
+    # 1. 环境变量（Streamlit Cloud secrets 也会注入为环境变量）
+    token = os.environ.get("XQ_TOKEN") or os.environ.get("xq_token")
     if token:
         return token
 
-    # 2. 本地 .xqtoken 文件
+    # 2. Streamlit secrets（TOML 格式，本地 + 云端通用）
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            token = st.secrets.get("xq_token") or st.secrets.get("XQ_TOKEN")
+            if token:
+                return token
+    except Exception:
+        pass
+
+    # 3. 本地 .xqtoken 文件（开发环境）
     token_path = Path(__file__).parent / ".xqtoken"
     if token_path.exists():
         return token_path.read_text().strip()
-
-    # 3. Streamlit secrets（云端部署）
-    try:
-        import streamlit as st
-        token = st.secrets.get("xq_token")
-        if token:
-            return token
-    except Exception:
-        pass
 
     return None
 
