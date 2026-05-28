@@ -21,7 +21,7 @@ import akshare as ak
 
 # 确保可以从 stock-advisor 目录导入
 sys.path.insert(0, str(Path(__file__).parent))
-from data_fetcher import get_realtime, get_history, get_fund_flow, get_financials, get_index_data
+from data_fetcher import get_realtime, get_realtime_bs, get_history, get_fund_flow, get_financials, get_index_data
 from analyzer import StockAnalyzer
 
 TARGET_PREFIXES = ("sh688", "sz300", "sz301")
@@ -112,7 +112,7 @@ def xq_fallback_scan():
     candidates = []
     for i, (code, name) in enumerate(sample):
         try:
-            rt = get_realtime(code)
+            rt = get_realtime_bs(code)
             if rt is None or rt["price"] <= 0:
                 continue
             score = 50.0
@@ -183,7 +183,7 @@ def xq_refine(candidates):
         refined = []
         for i, (code, name, sina_score) in enumerate(top_n):
             try:
-                rt = get_realtime(code)
+                rt = get_realtime_bs(code)
                 if rt is None or rt["price"] <= 0:
                     continue
                 score = 50.0

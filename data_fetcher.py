@@ -8,7 +8,10 @@
 
 import akshare as ak
 import pandas as pd
+import numpy as np
 from typing import Optional
+from datetime import datetime, timedelta
+from pathlib import Path
 
 
 # ---- 工具函数 ----
@@ -79,11 +82,20 @@ def search_stock(keyword: str, stock_list: list) -> list[tuple[str, str]]:
 
 # ---- 实时行情（雪球） ----
 
+def _load_xq_token() -> Optional[str]:
+    """加载雪球 token（从 .xqtoken 文件）。"""
+    token_path = Path(__file__).parent / ".xqtoken"
+    if token_path.exists():
+        return token_path.read_text().strip()
+    return None
+
+
 def get_realtime(code: str) -> Optional[dict]:
-    """获取单只股票实时行情（雪球数据源，含 PE/PB/换手率）。量比通过日线数据另行计算。"""
+    """获取单只股票实时行情（雪球数据源，含 PE/PB/换手率）。"""
     try:
         symbol = _to_xq_symbol(code)
-        df = ak.stock_individual_spot_xq(symbol=symbol)
+        token = _load_xq_token()
+        df = ak.stock_individual_spot_xq(symbol=symbol, token=token)
         data = dict(zip(df["item"].values, df["value"].values))
         return {
             "code": str(code).zfill(6),
@@ -129,6 +141,222 @@ def _compute_volume_ratio(code: str) -> float:
         return 1.0
     except Exception:
         return 1.0
+
+
+# ---- 实时行情（Baostock 备用，雪球已失效） ----
+
+def _to_bs_symbol(code: str) -> str:
+    """将纯数字代码转为 baostock 格式 (sh.600519 / sz.000001)。"""
+    code = str(code).zfill(6)
+    if code.startswith(("6", "9")):
+        return f"sh.{code}"
+    elif code.startswith(("0", "3", "2")):
+        return f"sz.{code}"
+    elif code.startswith(("4", "8")):
+        return f"bj.{code}"
+    return f"sh.{code}"
+
+
+def get_sina_spot_dict() -> Optional[dict]:
+    """获取 Sina 全市场行情，返回 {纯代码: row_data} 字典。一次调用，全体缓存。
+
+    带重试机制：Sina 接口偶发 JSON 解析失败，重试最多 3 次。
+    """
+    import time
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_spot()
+            if df is None or df.empty:
+                if attempt < 2:
+                    time.sleep(5)
+                continue
+            result = {}
+            for _, row in df.iterrows():
+                code = str(row[df.columns[0]])
+                if code.startswith(("sh", "sz", "bj")) and len(code) >= 2:
+                    pure = code[2:]
+                    result[pure] = row
+            if result:
+                return result
+            if attempt < 2:
+                time.sleep(5)
+        except Exception:
+            if attempt < 2:
+                time.sleep(5)
+    return None
+
+
+def get_realtime_today(code: str, sina_dict: Optional[dict] = None) -> Optional[dict]:
+    """获取当日行情。优先级：雪球 > Sina > Baostock。
+
+    如果配置了 .xqtoken，优先用雪球实时接口（有 PE/PB/换手率）。
+    否则尝试 Sina 当天数据，最后回退 Baostock。
+    """
+    # 第一步：尝试雪球（有 token 且可用时最快最全）
+    xq = get_realtime(code)
+    if xq is not None and xq["price"] > 0:
+        xq["_source"] = "xueqiu"
+        return xq
+
+    result = None
+
+    # 第二步：从 Sina 字典获取当天价格（如果有）
+    if sina_dict is not None and code in sina_dict:
+        row = sina_dict[code]
+        try:
+            # row 是 pandas Series，用 .iloc 按位置访问
+            result = {
+                "code": str(code).zfill(6),
+                "name": str(row.iloc[1]) if len(row) > 1 else "",
+                "price": _safe_float(row.iloc[2]),
+                "change_pct": _safe_float(row.iloc[4]),
+                "change_amount": _safe_float(row.iloc[3]),
+                "volume": _safe_float(row.iloc[11]),
+                "amount": _safe_float(row.iloc[12]),
+                "high": _safe_float(row.iloc[9]),
+                "low": _safe_float(row.iloc[10]),
+                "open": _safe_float(row.iloc[8]),
+                "pre_close": _safe_float(row.iloc[7]),
+                "amplitude": 0, "volume_ratio": 1.0,
+                "turnover_rate": 0, "pe_dynamic": 0, "pe_ttm": 0,
+                "pb": 0, "eps": 0, "nav_per_share": 0,
+                "total_market_cap": 0, "high_52w": 0, "low_52w": 0,
+                "dividend_yield": 0, "_source": "sina",
+            }
+            if result["pre_close"] > 0:
+                result["amplitude"] = round(
+                    (result["high"] - result["low"]) / result["pre_close"] * 100, 2
+                )
+        except (ValueError, TypeError, IndexError):
+            result = None
+
+    # 第二步：Sina 失败则回退 Baostock
+    if result is None:
+        bs_data = get_realtime_bs(code)
+        if bs_data:
+            bs_data["_source"] = "baostock"
+            return bs_data
+        return None
+
+    # 第三步：用 Baostock 补充 PE/PB/换手率
+    try:
+        import baostock as bs
+        symbol = _to_bs_symbol(code)
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+        bs.login()
+        try:
+            rs = bs.query_history_k_data_plus(
+                symbol, "date,peTTM,pbMRQ,turn,volume",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="3"
+            )
+            if rs.error_code == "0" and rs.data:
+                latest = rs.data[-1]
+                result["pe_dynamic"] = float(latest[1]) if len(latest) > 1 else 0
+                result["pe_ttm"] = float(latest[1]) if len(latest) > 1 else 0
+                result["pb"] = float(latest[2]) if len(latest) > 2 else 0
+                result["turnover_rate"] = float(latest[3]) if len(latest) > 3 else 0
+
+                # 量比 = 今日量 / 近5日均量（用 Baostock T-5~T-1 数据）
+                if result["volume"] > 0 and len(rs.data) >= 6:
+                    vols = [float(r[4]) for r in rs.data[-6:-1]]
+                    avg_vol = sum(vols) / len(vols)
+                    if avg_vol > 0:
+                        result["volume_ratio"] = round(result["volume"] / avg_vol, 2)
+        finally:
+            bs.logout()
+    except Exception:
+        pass
+
+    return result
+
+
+def get_realtime_bs(code: str) -> Optional[dict]:
+    """获取单只股票最新日线数据（Baostock，含 PE/PB/换手率）。
+
+    替代已失效的雪球 get_realtime()。Baostock 数据为最近交易日收盘数据。
+    """
+    try:
+        import baostock as bs
+        symbol = _to_bs_symbol(code)
+
+        # 获取最近2个交易日数据（确保有昨收）
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+
+        bs.login()
+        try:
+            rs = bs.query_history_k_data_plus(
+                symbol,
+                "date,open,high,low,close,preclose,volume,amount,peTTM,pbMRQ,turn",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="3"
+            )
+            if rs.error_code != "0" or not rs.data:
+                return None
+
+            # 字段: date[0], open[1], high[2], low[3], close[4], preclose[5],
+            #        volume[6], amount[7], peTTM[8], pbMRQ[9], turn[10]
+            latest = rs.data[-1]
+            cur_price = float(latest[4])  # close
+            pre_close = float(latest[5])  # preclose
+            vol_today = float(latest[6])
+            amount = float(latest[7])
+            high = float(latest[2])
+            low = float(latest[3])
+            open_price = float(latest[1])
+
+            # 涨跌幅
+            if pre_close > 0:
+                change_pct = (cur_price - pre_close) / pre_close * 100
+            else:
+                change_pct = 0
+
+            # 振幅
+            if pre_close > 0:
+                amplitude = (high - low) / pre_close * 100
+            else:
+                amplitude = 0
+
+            # 量比（近5日均量）
+            if len(rs.data) >= 6:
+                vols = [float(r[6]) for r in rs.data[-6:-1]]
+                avg_vol = sum(vols) / len(vols)
+                volume_ratio = round(vol_today / avg_vol, 2) if avg_vol > 0 else 1.0
+            else:
+                volume_ratio = 1.0
+
+            return {
+                "code": str(code).zfill(6),
+                "name": "",
+                "price": cur_price,
+                "change_pct": round(change_pct, 2),
+                "change_amount": round(cur_price - pre_close, 2),
+                "volume": vol_today,
+                "amount": amount,
+                "amplitude": round(amplitude, 2),
+                "high": high,
+                "low": low,
+                "open": open_price,
+                "pre_close": pre_close,
+                "volume_ratio": volume_ratio,
+                "turnover_rate": float(latest[10]) if len(latest) > 10 else 0,
+                "pe_dynamic": float(latest[8]) if len(latest) > 8 else 0,
+                "pe_ttm": float(latest[8]) if len(latest) > 8 else 0,
+                "pe_static": 0,
+                "pb": float(latest[9]) if len(latest) > 9 else 0,
+                "eps": 0,
+                "nav_per_share": 0,
+                "total_market_cap": 0,
+                "high_52w": 0,
+                "low_52w": 0,
+                "dividend_yield": 0,
+            }
+        finally:
+            bs.logout()
+    except Exception:
+        return None
 
 
 # ---- 历史 K 线 ----
